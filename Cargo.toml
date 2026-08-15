@@ -1,0 +1,47 @@
+[package]
+name = "CatScales"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "CatScales"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+embassy-usb-logger = "0.6.0"
+log = "0.4"
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+    "executor-thread",
+] }
+cortex-m = { version = "0.7.7", features = [
+    #"critical-section-single-core", # For use with SoftDevice use nrf-softdevice's critical section implementation instead.
+    "inline-asm",
+] }
+cortex-m-rt = "0.7.5"
+embassy-nrf = { version = "0.11.0", features = [
+    "nrf52840",
+    "unstable-pac",
+    "time",
+    "time-driver-rtc1", # RTC0 is used by softdevice, so RTC1 should be fine.
+    "gpiote",
+] }
+embassy-time = "0.5.1"
+embassy-usb = "0.6.0"
+nrf-softdevice = { version = "0.1.0", features = [
+    "ble-peripheral",
+    "ble-central",
+    "nrf52840",
+    "s140",
+    "critical-section-impl",
+] }
+static_cell = "2"
+loadcell = "0.3"
+embedded-hal = "1.0.0"
+lis3dh-async = "0.9"
+
+[package.metadata.cargo-shear]
+ignored = ["cortex-m-rt"] # Needed for entry point
