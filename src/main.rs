@@ -2,6 +2,8 @@
 #![no_main]
 
 use cortex_m::asm::nop;
+use cortex_m::interrupt::InterruptNumber;
+use cortex_m_rt::{exception, ExceptionFrame};
 use embassy_executor::Spawner;
 use embassy_nrf::{
     bind_interrupts, gpio,
@@ -15,7 +17,7 @@ use embassy_usb::{UsbDevice};
 use embassy_usb::class::cdc_acm::CdcAcmClass;
 use embassy_usb_logger::ReceiverHandler;
 use nrf_softdevice::{Softdevice, ble};
-use static_cell::{ConstStaticCell, StaticCell};
+use static_cell::{StaticCell};
 use embedded_hal::digital::{InputPin, OutputPin};
 use loadcell::{hx711::HX711, LoadCell};
 use lis3dh_async::{
@@ -47,9 +49,25 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     }
 }
 
-type Accel = Lis3dh<lis3dh_async::Lis3dhI2C<twim::Twim<'static>>>;
+#[exception]
+unsafe fn HardFault(_ef: &ExceptionFrame) -> ! {
+    let p0 = embassy_nrf::pac::P0;
 
-async fn init_accelerometer<LedPin>(i2c: twim::Twim<'static>, mut led: LedPin) -> Accel
+    loop {
+        p0.outclr().write(|w| { w.set_pin(26, true) });
+        cortex_m::asm::delay(1_000_000);
+        p0.outset().write(|w| { w.set_pin(26, true) });
+        cortex_m::asm::delay(1_000_000);
+        p0.outclr().write(|w| { w.set_pin(26, true) });
+        cortex_m::asm::delay(1_000_000);
+        p0.outset().write(|w| { w.set_pin(26, true) });
+        cortex_m::asm::delay(5_000_000);
+    }
+}
+
+type Accel = Lis3dh<lis3dh_async::Lis3dhI2C<twim::Twim<'static, peripherals::TWISPI0>>>;
+
+async fn init_accelerometer<LedPin>(i2c: twim::Twim<'static, peripherals::TWISPI0>, mut led: LedPin) -> Accel
 where
     LedPin: OutputPin
 {
@@ -127,7 +145,7 @@ impl ReceiverHandler for BootloaderHandler {
     }
 }
 
-type UsbDriver = usb::Driver<'static, &'static usb::vbus_detect::SoftwareVbusDetect>;
+type UsbDriver = usb::Driver<'static, peripherals::USBD, &'static usb::vbus_detect::SoftwareVbusDetect>;
 
 #[embassy_executor::task]
 async fn softdevice_task(
@@ -150,7 +168,7 @@ async fn softdevice_task(
 
 #[embassy_executor::task]
 async fn usb_task(mut device: UsbDevice<'static, UsbDriver>) -> ! {
-    device.run().await;
+    device.run().await
 }
 
 #[embassy_executor::task]
@@ -163,25 +181,26 @@ async fn main(spawner: Spawner) {
     // Per https://github.com/embassy-rs/nrf-softdevice/tree/nrf-softdevice-v0.1.0#interrupt-priority
     // Interrupt priorities 0, 1 and 4 are reserved by the Softdevice, so we have to use 2 or 3 for all interrupts.
     let mut config = embassy_nrf::config::Config::default();
+    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
+    config.lfclk_source = embassy_nrf::config::LfclkSource::InternalRC;
     config.gpiote_interrupt_priority = interrupt::Priority::P2;
     config.time_interrupt_priority = interrupt::Priority::P2;
     let peripherals = embassy_nrf::init(config);
     interrupt::typelevel::USBD::set_priority(interrupt::Priority::P2);
-    interrupt::typelevel::TWISPI0::set_priority(interrupt::Priority::P2);
-    interrupt::typelevel::CLOCK_POWER::set_priority(interrupt::Priority::P2);
+    interrupt::typelevel::TWISPI0::set_priority(interrupt::Priority::P3);
 
     let config = softdevice_config();
     let sd = Softdevice::enable(&config);
 
     let vbus = setup_usb(&spawner, peripherals.USBD);
-    spawner.spawn(softdevice_task(sd, vbus).unwrap());
+    spawner.spawn(softdevice_task(sd, vbus)).unwrap();
     Timer::after(Duration::from_secs(1)).await; // wait listener to connect
 
-    // let mut led_red = gpio::Output::new(peripherals.P0_26, gpio::Level::High, gpio::OutputDrive::Standard);
-    // let mut led_green = gpio::Output::new(peripherals.P0_30, gpio::Level::High, gpio::OutputDrive::Standard);
+    let mut led_red = gpio::Output::new(peripherals.P0_26, gpio::Level::High, gpio::OutputDrive::Standard);
+    let mut led_green = gpio::Output::new(peripherals.P0_30, gpio::Level::High, gpio::OutputDrive::Standard);
     let led_blue = gpio::Output::new(peripherals.P0_06, gpio::Level::High, gpio::OutputDrive::Standard);
 
-    spawner.spawn(heartbeat_task(led_blue).unwrap());
+    spawner.spawn(heartbeat_task(led_blue)).unwrap();
     log::info!("Blink...");
 
     let mut config = twim::Config::default();
@@ -194,9 +213,63 @@ async fn main(spawner: Spawner) {
         Irqs,
         peripherals.P1_13,
         peripherals.P1_12,
-        config,
-        &mut[]
+        config
     );
+
+    const IRQS: [Interrupt; 43] = [
+        Interrupt::CLOCK_POWER,
+        Interrupt::RADIO,
+        Interrupt::UARTE0,
+        Interrupt::TWISPI0,
+        Interrupt::TWISPI1,
+        Interrupt::NFCT,
+        Interrupt::GPIOTE,
+        Interrupt::SAADC,
+        Interrupt::TIMER0,
+        Interrupt::TIMER1,
+        Interrupt::TIMER2,
+        Interrupt::RTC0,
+        Interrupt::TEMP,
+        Interrupt::RNG,
+        Interrupt::ECB,
+        Interrupt::AAR_CCM,
+        Interrupt::WDT,
+        Interrupt::RTC1,
+        Interrupt::QDEC,
+        Interrupt::COMP_LPCOMP,
+        Interrupt::EGU0_SWI0,
+        Interrupt::EGU1_SWI1,
+        Interrupt::EGU2_SWI2,
+        Interrupt::EGU3_SWI3,
+        Interrupt::EGU4_SWI4,
+        Interrupt::EGU5_SWI5,
+        Interrupt::TIMER3,
+        Interrupt::TIMER4,
+        Interrupt::PWM0,
+        Interrupt::PDM,
+        Interrupt::MWU,
+        Interrupt::PWM1,
+        Interrupt::PWM2,
+        Interrupt::SPI2,
+        Interrupt::RTC2,
+        Interrupt::I2S,
+        Interrupt::FPU,
+        Interrupt::USBD,
+        Interrupt::UARTE1,
+        Interrupt::QSPI,
+        Interrupt::CRYPTOCELL,
+        Interrupt::PWM3,
+        Interrupt::SPIM3,
+    ];
+
+    use embassy_nrf::interrupt::{Interrupt, InterruptExt};
+    for interrupt in IRQS {
+        let is_enabled = InterruptExt::is_enabled(interrupt);
+        let priority = InterruptExt::get_priority(interrupt);
+
+        log::info!("Interrupt {}: Enabled = {}, Priority = {:?}", interrupt.number(), is_enabled, priority);
+        Timer::after(Duration::from_millis(100)).await;
+    }
 
     // Async i2c test
     log::info!("Trying to connect...");
@@ -314,7 +387,7 @@ async fn setup_ble_advertising(sd: &'static Softdevice, weight: f32, weight_raw:
 
 fn setup_usb(
     spawner: &Spawner,
-    usbd: embassy_nrf::Peri<'static, peripherals::USBD>,
+    usbd: peripherals::USBD,
 ) -> &'static usb::vbus_detect::SoftwareVbusDetect {
     // Enable USB events on softdevice.
     unsafe {
@@ -368,9 +441,8 @@ fn setup_usb(
 
     let device = builder.build();
 
-    spawner.spawn(usb_task(device).unwrap());
-    spawner.spawn(logger_task(class).unwrap());
-    // spawner.spawn(usb_read_write_task(class).unwrap());
+    spawner.spawn(usb_task(device)).unwrap();
+    spawner.spawn(logger_task(class)).unwrap();
 
     vbus
 }
