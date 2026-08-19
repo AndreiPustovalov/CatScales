@@ -65,9 +65,9 @@ unsafe fn HardFault(_ef: &ExceptionFrame) -> ! {
     }
 }
 
-type Accel = Lis3dh<lis3dh_async::Lis3dhI2C<twim::Twim<'static, peripherals::TWISPI0>>>;
+type Accel = Lis3dh<lis3dh_async::Lis3dhI2C<twim::Twim<'static>>>;
 
-async fn init_accelerometer<LedPin>(i2c: twim::Twim<'static, peripherals::TWISPI0>, mut led: LedPin) -> Accel
+async fn init_accelerometer<LedPin>(i2c: twim::Twim<'static>, mut led: LedPin) -> Accel
 where
     LedPin: OutputPin
 {
@@ -145,7 +145,7 @@ impl ReceiverHandler for BootloaderHandler {
     }
 }
 
-type UsbDriver = usb::Driver<'static, peripherals::USBD, &'static usb::vbus_detect::SoftwareVbusDetect>;
+type UsbDriver = usb::Driver<'static, &'static usb::vbus_detect::SoftwareVbusDetect>;
 
 #[embassy_executor::task]
 async fn softdevice_task(
@@ -193,14 +193,14 @@ async fn main(spawner: Spawner) {
     let sd = Softdevice::enable(&config);
 
     let vbus = setup_usb(&spawner, peripherals.USBD);
-    spawner.spawn(softdevice_task(sd, vbus)).unwrap();
+    spawner.spawn(softdevice_task(sd, vbus).unwrap());
     Timer::after(Duration::from_secs(1)).await; // wait listener to connect
 
     let mut led_red = gpio::Output::new(peripherals.P0_26, gpio::Level::High, gpio::OutputDrive::Standard);
     let mut led_green = gpio::Output::new(peripherals.P0_30, gpio::Level::High, gpio::OutputDrive::Standard);
     let led_blue = gpio::Output::new(peripherals.P0_06, gpio::Level::High, gpio::OutputDrive::Standard);
 
-    spawner.spawn(heartbeat_task(led_blue)).unwrap();
+    spawner.spawn(heartbeat_task(led_blue).unwrap());
     log::info!("Blink...");
 
     let mut config = twim::Config::default();
@@ -213,63 +213,9 @@ async fn main(spawner: Spawner) {
         Irqs,
         peripherals.P1_13,
         peripherals.P1_12,
-        config
+        config,
+        &mut[]
     );
-
-    const IRQS: [Interrupt; 43] = [
-        Interrupt::CLOCK_POWER,
-        Interrupt::RADIO,
-        Interrupt::UARTE0,
-        Interrupt::TWISPI0,
-        Interrupt::TWISPI1,
-        Interrupt::NFCT,
-        Interrupt::GPIOTE,
-        Interrupt::SAADC,
-        Interrupt::TIMER0,
-        Interrupt::TIMER1,
-        Interrupt::TIMER2,
-        Interrupt::RTC0,
-        Interrupt::TEMP,
-        Interrupt::RNG,
-        Interrupt::ECB,
-        Interrupt::AAR_CCM,
-        Interrupt::WDT,
-        Interrupt::RTC1,
-        Interrupt::QDEC,
-        Interrupt::COMP_LPCOMP,
-        Interrupt::EGU0_SWI0,
-        Interrupt::EGU1_SWI1,
-        Interrupt::EGU2_SWI2,
-        Interrupt::EGU3_SWI3,
-        Interrupt::EGU4_SWI4,
-        Interrupt::EGU5_SWI5,
-        Interrupt::TIMER3,
-        Interrupt::TIMER4,
-        Interrupt::PWM0,
-        Interrupt::PDM,
-        Interrupt::MWU,
-        Interrupt::PWM1,
-        Interrupt::PWM2,
-        Interrupt::SPI2,
-        Interrupt::RTC2,
-        Interrupt::I2S,
-        Interrupt::FPU,
-        Interrupt::USBD,
-        Interrupt::UARTE1,
-        Interrupt::QSPI,
-        Interrupt::CRYPTOCELL,
-        Interrupt::PWM3,
-        Interrupt::SPIM3,
-    ];
-
-    use embassy_nrf::interrupt::{Interrupt, InterruptExt};
-    for interrupt in IRQS {
-        let is_enabled = InterruptExt::is_enabled(interrupt);
-        let priority = InterruptExt::get_priority(interrupt);
-
-        log::info!("Interrupt {}: Enabled = {}, Priority = {:?}", interrupt.number(), is_enabled, priority);
-        Timer::after(Duration::from_millis(100)).await;
-    }
 
     // Async i2c test
     log::info!("Trying to connect...");
@@ -387,7 +333,7 @@ async fn setup_ble_advertising(sd: &'static Softdevice, weight: f32, weight_raw:
 
 fn setup_usb(
     spawner: &Spawner,
-    usbd: peripherals::USBD,
+    usbd: embassy_nrf::Peri<'static, peripherals::USBD>,
 ) -> &'static usb::vbus_detect::SoftwareVbusDetect {
     // Enable USB events on softdevice.
     unsafe {
@@ -441,8 +387,8 @@ fn setup_usb(
 
     let device = builder.build();
 
-    spawner.spawn(usb_task(device)).unwrap();
-    spawner.spawn(logger_task(class)).unwrap();
+    spawner.spawn(usb_task(device).unwrap());
+    spawner.spawn(logger_task(class).unwrap());
 
     vbus
 }

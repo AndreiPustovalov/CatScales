@@ -11,35 +11,35 @@ doctest = false
 bench = false
 
 [dependencies]
-embassy-executor = { version = "0.7.0", features = [
-    #    "platform-cortex-m",
-    "arch-cortex-m",
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+#    "arch-cortex-m",
     "executor-thread",
     "executor-interrupt"
 ] }
 embassy-time = "0.5.1"
 log = "0.4"
-cortex-m = { version = "0.7.7", features = [
+cortex-m = { version = "0.7.8", features = [
     #"critical-section-single-core", # For use with SoftDevice use nrf-softdevice's critical section implementation instead.
     "inline-asm",
 ] }
 cortex-m-rt = "0.7.3"
-embassy-nrf = { version = "0.3.0", features = [
+embassy-nrf = { version = "0.11.0", features = [
     "nrf52840",
     "unstable-pac",
     "time",
     "time-driver-rtc1", # RTC0 is used by softdevice, so RTC1 should be fine.
     "gpiote",
 ] }
-nrf-softdevice = { version = "0.1.0", features = [
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", features = [
     "ble-peripheral",
     "ble-central",
     "nrf52840",
     "s140",
     "critical-section-impl",
 ] }
-embassy-usb = "0.4.0"
-embassy-usb-logger = "0.4.0"
+embassy-usb = "0.6.0"
+embassy-usb-logger = "0.6.0"
 static_cell = "2"
 loadcell = "0.3"
 embedded-hal = "1.0.0"
