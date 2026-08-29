@@ -20,7 +20,8 @@ use nb::Error::WouldBlock;
 use rtt_target::rtt_init_log;
 
 // const SCALE: f32 = 1.0/57156.0;
-const SCALE: f32 = 1.0/114312.0;
+const SCALE1: f32 = 9.097367596346918e-06;
+
 bind_interrupts!(
     struct Irqs {
         USBD => usb::InterruptHandler<peripherals::USBD>;
@@ -217,7 +218,7 @@ async fn main(spawner: Spawner) {
 
         load_sensor.enable().expect("Can't enable hx711");
         if let Some(raw) = read_weight(&mut load_sensor, offset).await {
-            let kg = (raw as f32 * SCALE);
+            let kg = (raw as f32 * SCALE1);
             setup_ble_advertising(sd, kg, raw, 90).await;
             log::info!("Sent: {} kg, {} raw", kg, raw);
         }
@@ -270,7 +271,7 @@ where
 }
 
 fn build_bthome_payload(weight_kg: f32, weight_raw: i32, battery_pct: u8) -> [u8; 19] {
-    let weight_converted = (weight_kg * 100.0) as u16;
+    let weight_converted = (weight_kg * 100.0 + 0.5) as u16;
 
     [
         // --- 1. GAP Flags (3 bytes) ---
@@ -312,7 +313,7 @@ async fn setup_ble_advertising(sd: &'static Softdevice, weight: f32, weight_raw:
     };
 
     let _ = with_timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(3),
         ble::peripheral::advertise(sd, adv, &config)
     ).await;
 }
