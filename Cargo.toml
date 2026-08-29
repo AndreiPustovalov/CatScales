@@ -39,9 +39,8 @@ nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", fea
     "critical-section-impl",
     "log",
 ] }
-embassy-usb = "0.6.0"
-static_cell = "2"
-loadcell = "0.3"
+hx711 = "0.7.0"
+nb = "1.1.0"
 embedded-hal = "1.0.0"
 lis3dh-async = "0.9"
 log = "0.4.33"

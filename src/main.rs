@@ -13,12 +13,14 @@ use embassy_nrf::{
 use embassy_time::{with_timeout, Delay, Duration, Timer, TimeoutError};
 use nrf_softdevice::{Softdevice, ble};
 use embedded_hal::digital::{InputPin, OutputPin};
-use loadcell::{hx711::HX711, LoadCell};
+use hx711::{Hx711};
 use lis3dh_async::{Lis3dh, SlaveAddr, Mode, DataRate, Range, IrqPin1Config, Interrupt1, InterruptMode, InterruptConfig, LatchInterruptRequest, Detect4D, Threshold, Duration as Lis3dhDuration, Error};
 use embedded_hal;
+use nb::Error::WouldBlock;
 use rtt_target::rtt_init_log;
 
-const SCALE: f32 = 1.0/57156.0;
+// const SCALE: f32 = 1.0/57156.0;
+const SCALE: f32 = 1.0/114312.0;
 bind_interrupts!(
     struct Irqs {
         USBD => usb::InterruptHandler<peripherals::USBD>;
@@ -190,10 +192,11 @@ async fn main(spawner: Spawner) {
     let sck_pin = gpio::Output::new(peripherals.P0_02, gpio::Level::Low, gpio::OutputDrive::Standard);
     let dout_pin = gpio::Input::new(peripherals.P0_03, gpio::Pull::Up);
 
-    let mut load_sensor = HX711::new(sck_pin, dout_pin, Delay);
-    load_sensor.set_scale(SCALE);
+    let mut load_sensor = Hx711::new(Delay, dout_pin, sck_pin).expect("Can't connect to hx711");
 
-    tare(&mut load_sensor, 5).await;
+    let offset = tare(&mut load_sensor, 5).await;
+    load_sensor.disable().expect("Can't disable hx711");
+    
     spawner.spawn(blink_task(led_blue).unwrap());
     loop {
         if int1_pin.is_high() {
@@ -212,10 +215,13 @@ async fn main(spawner: Spawner) {
         }
         Timer::after(Duration::from_secs(5)).await;
 
-        if let Some((raw, kg)) = read_weight(&mut load_sensor).await {
+        load_sensor.enable().expect("Can't enable hx711");
+        if let Some(raw) = read_weight(&mut load_sensor, offset).await {
+            let kg = (raw as f32 * SCALE);
             setup_ble_advertising(sd, kg, raw, 90).await;
             log::info!("Sent: {} kg, {} raw", kg, raw);
         }
+        load_sensor.disable().expect("Can't disable hx711");
     }
 }
 
@@ -230,36 +236,37 @@ async fn blink_task(mut led: gpio::Output<'static>) {
 }
 
 async fn read_weight<SckPin, DTPin>(
-    load_sensor: &mut HX711<SckPin, DTPin, Delay>,
-) -> Option<(i32, f32)>
+    load_sensor: &mut Hx711<Delay, DTPin, SckPin>,
+    offset: i32
+) -> Option<i32>
 where
     SckPin: OutputPin,
     DTPin: InputPin
 {
-    while !load_sensor.is_ready() {
-        Timer::after(Duration::from_millis(10)).await;
-    }
-    match load_sensor.read() {
-        Ok(raw) => Some((raw, raw as f32 * load_sensor.get_scale())),
-        Err(e) => {log::error!("Error: {:?}", e); None}
+    loop {
+        match load_sensor.retrieve() {
+            Err(WouldBlock) => Timer::after(Duration::from_millis(10)).await,
+            Ok(raw) => break Some(raw - offset),
+            Err(e) => {
+                log::error!("Error: {:?}", e);
+                break None
+            }
+        }
     }
 }
 
-async fn tare<SckPin, DTPin>(load_sensor: &mut HX711<SckPin, DTPin, Delay>, num_samples: u8)
+async fn tare<SckPin, DTPin>(load_sensor: &mut Hx711<Delay, DTPin, SckPin>, num_samples: u8) -> i32
 where
     SckPin: OutputPin,
     DTPin: InputPin
 {
-    let mut average: f32 = 0.0;
+    let mut average: i32 = 0;
     for _ in 1..=num_samples {
-        while !load_sensor.is_ready() {
-            Timer::after(Duration::from_millis(10)).await;
-        }
-        average += load_sensor.read().unwrap() as f32;
+        let raw = read_weight(load_sensor, 0).await.expect("Couldn't read weight");
+        average += raw;
         Timer::after(Duration::from_millis(50)).await;
     }
-
-    load_sensor.set_offset((average / num_samples as f32) as i32);
+    (average as f32 / num_samples as f32) as i32
 }
 
 fn build_bthome_payload(weight_kg: f32, weight_raw: i32, battery_pct: u8) -> [u8; 19] {
