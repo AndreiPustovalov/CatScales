@@ -3,6 +3,7 @@ set -e
 
 COM_PORT=COM12
 #COM_PORT=COM15
+#COM_PORT=COM20
 
 cargo build --release
 arm-none-eabi-objcopy -O ihex target/thumbv7em-none-eabihf/release/CatScales target/CatScales.hex

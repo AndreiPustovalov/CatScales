@@ -11,6 +11,7 @@ doctest = false
 bench = false
 
 [dependencies]
+rtt-target = { version = "0.6", features = ["log"] }
 embassy-executor = { version = "0.10.0", features = [
     "platform-cortex-m",
 #    "arch-cortex-m",
@@ -18,7 +19,6 @@ embassy-executor = { version = "0.10.0", features = [
     "executor-interrupt"
 ] }
 embassy-time = "0.5.1"
-log = "0.4"
 cortex-m = { version = "0.7.8", features = [
     #"critical-section-single-core", # For use with SoftDevice use nrf-softdevice's critical section implementation instead.
     "inline-asm",
@@ -37,13 +37,14 @@ nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", fea
     "nrf52840",
     "s140",
     "critical-section-impl",
+    "log",
 ] }
 embassy-usb = "0.6.0"
-embassy-usb-logger = "0.6.0"
 static_cell = "2"
 loadcell = "0.3"
 embedded-hal = "1.0.0"
 lis3dh-async = "0.9"
+log = "0.4.33"
 
 [package.metadata.cargo-shear]
 ignored = ["cortex-m-rt"] # Needed for entry point
