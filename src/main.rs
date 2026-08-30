@@ -128,7 +128,6 @@ async fn main(spawner: Spawner) {
     // Per https://github.com/embassy-rs/nrf-softdevice/tree/nrf-softdevice-v0.1.0#interrupt-priority
     // Interrupt priorities 0, 1 and 4 are reserved by the Softdevice, so we have to use 2 or 3 for all interrupts.
     let mut config = embassy_nrf::config::Config::default();
-    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     config.lfclk_source = embassy_nrf::config::LfclkSource::InternalRC;
     config.gpiote_interrupt_priority = interrupt::Priority::P2;
     config.time_interrupt_priority = interrupt::Priority::P2;
@@ -158,18 +157,10 @@ async fn main(spawner: Spawner) {
         &mut[]
     );
 
-    let mut a = match init_accelerometer(i2c).await {
-        Ok(a) => {
-            log::info!("WHO_AM_I = {:?}", 0);
-            a
-        },
-        Err(e) => {
-            log::error!("Error: {:?}", e);
-            panic!("Error: {:?}", e);
-        },
-    };
+    let mut a = init_accelerometer(i2c).await.expect("cannot initialize accelerometer");
 
     let mut int1_pin = gpio::Input::new(peripherals.P0_28, gpio::Pull::None); // accelerometer interrupt
+    let dfu_btn = gpio::Input::new(peripherals.P1_11, gpio::Pull::Up); // dfu button
 
     let sck_pin = gpio::Output::new(peripherals.P0_02, gpio::Level::Low, gpio::OutputDrive::Standard);
     let dout_pin = gpio::Input::new(peripherals.P0_03, gpio::Pull::Up);
@@ -180,6 +171,7 @@ async fn main(spawner: Spawner) {
     load_sensor.disable().expect("Can't disable hx711");
     
     spawner.spawn(blink_task(led_blue).unwrap());
+    spawner.spawn(bootloader(dfu_btn).unwrap());
     loop {
         if int1_pin.is_high() {
             a.get_irq_src(Interrupt1).await.expect("Couldn't get irq src");
@@ -210,6 +202,13 @@ async fn blink_task(mut led: gpio::Output<'static>) {
         Timer::after(Duration::from_millis(300)).await;
     }
 }
+
+#[embassy_executor::task]
+async fn bootloader(mut dfu_btn: gpio::Input<'static>) -> ! {
+    dfu_btn.wait_for_falling_edge().await;
+    reset_into_dfu()
+}
+
 
 async fn read_weight<SckPin, DTPin>(
     load_sensor: &mut Hx711<Delay, DTPin, SckPin>,
