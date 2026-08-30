@@ -7,7 +7,6 @@ use embassy_nrf::{
     bind_interrupts, gpio,
     interrupt::{self, typelevel::Interrupt as _},
     peripherals,
-    usb::{self},
     twim
 };
 use embassy_time::{with_timeout, Delay, Duration, Timer};
@@ -24,7 +23,6 @@ const SCALE1: f32 = 9.097367596346918e-06;
 
 bind_interrupts!(
     struct Irqs {
-        USBD => usb::InterruptHandler<peripherals::USBD>;
         TWISPI1 => twim::InterruptHandler<peripherals::TWISPI1>;
     }
 );
@@ -132,7 +130,6 @@ async fn main(spawner: Spawner) {
     config.gpiote_interrupt_priority = interrupt::Priority::P2;
     config.time_interrupt_priority = interrupt::Priority::P2;
     let peripherals = embassy_nrf::init(config);
-    interrupt::typelevel::USBD::set_priority(interrupt::Priority::P2);
     interrupt::typelevel::TWISPI0::set_priority(interrupt::Priority::P3);
     interrupt::typelevel::TWISPI1::set_priority(interrupt::Priority::P3);
 
