@@ -10,7 +10,7 @@ use embassy_nrf::{
     usb::{self},
     twim
 };
-use embassy_time::{with_timeout, Delay, Duration, Timer, TimeoutError};
+use embassy_time::{with_timeout, Delay, Duration, Timer};
 use nrf_softdevice::{Softdevice, ble};
 use embedded_hal::digital::{InputPin, OutputPin};
 use hx711::{Hx711};
@@ -121,25 +121,6 @@ fn reset_into_dfu() -> ! {
     cortex_m::peripheral::SCB::sys_reset();
 }
 
-#[embassy_executor::task]
-async fn softdevice_task(
-    sd: &'static Softdevice,
-    vbus: &'static usb::vbus_detect::SoftwareVbusDetect,
-) -> ! {
-    sd.run_with_callback(|event| {
-        use nrf_softdevice::SocEvent;
-
-        // Forward USB events.
-        match event {
-            SocEvent::PowerUsbDetected => vbus.detected(true),
-            SocEvent::PowerUsbRemoved => vbus.detected(false),
-            SocEvent::PowerUsbPowerReady => vbus.ready(),
-            _ => {}
-        }
-    })
-        .await
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     rtt_init_log!();
@@ -203,22 +184,16 @@ async fn main(spawner: Spawner) {
         if int1_pin.is_high() {
             a.get_irq_src(Interrupt1).await.expect("Couldn't get irq src");
         }
-        match with_timeout(Duration::from_secs(60), int1_pin.wait_for_rising_edge()).await {
-            Ok(_) => {
-                match a.get_irq_src(Interrupt1).await {
-                    Ok(src) => log::info!("Edge detected: {:?}. Waiting", src),
-                    Err(e) => log::error!("Error waiting edge: {:?}", e)
-                }
-            },
-            Err(e) => match e {
-                TimeoutError => log::info!("Timeout")
-            },
+        int1_pin.wait_for_rising_edge().await;
+        match a.get_irq_src(Interrupt1).await {
+            Ok(src) => log::info!("Edge detected: {:?}. Waiting", src),
+            Err(e) => log::error!("Error waiting edge: {:?}", e)
         }
         Timer::after(Duration::from_secs(5)).await;
 
         load_sensor.enable().expect("Can't enable hx711");
         if let Some(raw) = read_weight(&mut load_sensor, offset).await {
-            let kg = (raw as f32 * SCALE1);
+            let kg = raw as f32 * SCALE1;
             setup_ble_advertising(sd, kg, raw, 90).await;
             log::info!("Sent: {} kg, {} raw", kg, raw);
         }
