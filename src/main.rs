@@ -7,21 +7,22 @@ use embassy_nrf::{
     bind_interrupts, gpio,
     interrupt::{self, typelevel::Interrupt as _},
     peripherals,
-    usb::{self},
     twim
 };
-use embassy_time::{with_timeout, Delay, Duration, Timer, TimeoutError};
+use embassy_time::{with_timeout, Delay, Duration, Timer};
 use nrf_softdevice::{Softdevice, ble};
 use embedded_hal::digital::{InputPin, OutputPin};
-use loadcell::{hx711::HX711, LoadCell};
+use hx711::{Hx711};
 use lis3dh_async::{Lis3dh, SlaveAddr, Mode, DataRate, Range, IrqPin1Config, Interrupt1, InterruptMode, InterruptConfig, LatchInterruptRequest, Detect4D, Threshold, Duration as Lis3dhDuration, Error};
 use embedded_hal;
+use nb::Error::WouldBlock;
 use rtt_target::rtt_init_log;
 
-const SCALE: f32 = 1.0/57156.0;
+// const SCALE: f32 = 1.0/57156.0;
+const SCALE1: f32 = 9.097367596346918e-06;
+
 bind_interrupts!(
     struct Irqs {
-        USBD => usb::InterruptHandler<peripherals::USBD>;
         TWISPI1 => twim::InterruptHandler<peripherals::TWISPI1>;
     }
 );
@@ -118,25 +119,6 @@ fn reset_into_dfu() -> ! {
     cortex_m::peripheral::SCB::sys_reset();
 }
 
-#[embassy_executor::task]
-async fn softdevice_task(
-    sd: &'static Softdevice,
-    vbus: &'static usb::vbus_detect::SoftwareVbusDetect,
-) -> ! {
-    sd.run_with_callback(|event| {
-        use nrf_softdevice::SocEvent;
-
-        // Forward USB events.
-        match event {
-            SocEvent::PowerUsbDetected => vbus.detected(true),
-            SocEvent::PowerUsbRemoved => vbus.detected(false),
-            SocEvent::PowerUsbPowerReady => vbus.ready(),
-            _ => {}
-        }
-    })
-        .await
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     rtt_init_log!();
@@ -144,12 +126,10 @@ async fn main(spawner: Spawner) {
     // Per https://github.com/embassy-rs/nrf-softdevice/tree/nrf-softdevice-v0.1.0#interrupt-priority
     // Interrupt priorities 0, 1 and 4 are reserved by the Softdevice, so we have to use 2 or 3 for all interrupts.
     let mut config = embassy_nrf::config::Config::default();
-    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
     config.lfclk_source = embassy_nrf::config::LfclkSource::InternalRC;
     config.gpiote_interrupt_priority = interrupt::Priority::P2;
     config.time_interrupt_priority = interrupt::Priority::P2;
     let peripherals = embassy_nrf::init(config);
-    interrupt::typelevel::USBD::set_priority(interrupt::Priority::P2);
     interrupt::typelevel::TWISPI0::set_priority(interrupt::Priority::P3);
     interrupt::typelevel::TWISPI1::set_priority(interrupt::Priority::P3);
 
@@ -174,48 +154,39 @@ async fn main(spawner: Spawner) {
         &mut[]
     );
 
-    let mut a = match init_accelerometer(i2c).await {
-        Ok(a) => {
-            log::info!("WHO_AM_I = {:?}", 0);
-            a
-        },
-        Err(e) => {
-            log::error!("Error: {:?}", e);
-            panic!("Error: {:?}", e);
-        },
-    };
+    let mut a = init_accelerometer(i2c).await.expect("cannot initialize accelerometer");
 
     let mut int1_pin = gpio::Input::new(peripherals.P0_28, gpio::Pull::None); // accelerometer interrupt
+    let dfu_btn = gpio::Input::new(peripherals.P1_11, gpio::Pull::Up); // dfu button
 
     let sck_pin = gpio::Output::new(peripherals.P0_02, gpio::Level::Low, gpio::OutputDrive::Standard);
     let dout_pin = gpio::Input::new(peripherals.P0_03, gpio::Pull::Up);
 
-    let mut load_sensor = HX711::new(sck_pin, dout_pin, Delay);
-    load_sensor.set_scale(SCALE);
+    let mut load_sensor = Hx711::new(Delay, dout_pin, sck_pin).expect("Can't connect to hx711");
 
-    tare(&mut load_sensor, 5).await;
+    let offset = tare(&mut load_sensor, 5).await;
+    load_sensor.disable().expect("Can't disable hx711");
+    
     spawner.spawn(blink_task(led_blue).unwrap());
+    spawner.spawn(bootloader(dfu_btn).unwrap());
     loop {
         if int1_pin.is_high() {
             a.get_irq_src(Interrupt1).await.expect("Couldn't get irq src");
         }
-        match with_timeout(Duration::from_secs(60), int1_pin.wait_for_rising_edge()).await {
-            Ok(_) => {
-                match a.get_irq_src(Interrupt1).await {
-                    Ok(src) => log::info!("Edge detected: {:?}. Waiting", src),
-                    Err(e) => log::error!("Error waiting edge: {:?}", e)
-                }
-            },
-            Err(e) => match e {
-                TimeoutError => log::info!("Timeout")
-            },
+        int1_pin.wait_for_rising_edge().await;
+        match a.get_irq_src(Interrupt1).await {
+            Ok(src) => log::info!("Edge detected: {:?}. Waiting", src),
+            Err(e) => log::error!("Error waiting edge: {:?}", e)
         }
         Timer::after(Duration::from_secs(5)).await;
 
-        if let Some((raw, kg)) = read_weight(&mut load_sensor).await {
+        load_sensor.enable().expect("Can't enable hx711");
+        if let Some(raw) = read_weight(&mut load_sensor, offset).await {
+            let kg = raw as f32 * SCALE1;
             setup_ble_advertising(sd, kg, raw, 90).await;
             log::info!("Sent: {} kg, {} raw", kg, raw);
         }
+        load_sensor.disable().expect("Can't disable hx711");
     }
 }
 
@@ -229,41 +200,49 @@ async fn blink_task(mut led: gpio::Output<'static>) {
     }
 }
 
+#[embassy_executor::task]
+async fn bootloader(mut dfu_btn: gpio::Input<'static>) -> ! {
+    dfu_btn.wait_for_falling_edge().await;
+    reset_into_dfu()
+}
+
+
 async fn read_weight<SckPin, DTPin>(
-    load_sensor: &mut HX711<SckPin, DTPin, Delay>,
-) -> Option<(i32, f32)>
+    load_sensor: &mut Hx711<Delay, DTPin, SckPin>,
+    offset: i32
+) -> Option<i32>
 where
     SckPin: OutputPin,
     DTPin: InputPin
 {
-    while !load_sensor.is_ready() {
-        Timer::after(Duration::from_millis(10)).await;
-    }
-    match load_sensor.read() {
-        Ok(raw) => Some((raw, raw as f32 * load_sensor.get_scale())),
-        Err(e) => {log::error!("Error: {:?}", e); None}
+    loop {
+        match load_sensor.retrieve() {
+            Err(WouldBlock) => Timer::after(Duration::from_millis(10)).await,
+            Ok(raw) => break Some(raw - offset),
+            Err(e) => {
+                log::error!("Error: {:?}", e);
+                break None
+            }
+        }
     }
 }
 
-async fn tare<SckPin, DTPin>(load_sensor: &mut HX711<SckPin, DTPin, Delay>, num_samples: u8)
+async fn tare<SckPin, DTPin>(load_sensor: &mut Hx711<Delay, DTPin, SckPin>, num_samples: u8) -> i32
 where
     SckPin: OutputPin,
     DTPin: InputPin
 {
-    let mut average: f32 = 0.0;
+    let mut average: i32 = 0;
     for _ in 1..=num_samples {
-        while !load_sensor.is_ready() {
-            Timer::after(Duration::from_millis(10)).await;
-        }
-        average += load_sensor.read().unwrap() as f32;
+        let raw = read_weight(load_sensor, 0).await.expect("Couldn't read weight");
+        average += raw;
         Timer::after(Duration::from_millis(50)).await;
     }
-
-    load_sensor.set_offset((average / num_samples as f32) as i32);
+    (average as f32 / num_samples as f32) as i32
 }
 
 fn build_bthome_payload(weight_kg: f32, weight_raw: i32, battery_pct: u8) -> [u8; 19] {
-    let weight_converted = (weight_kg * 100.0) as u16;
+    let weight_converted = (weight_kg * 100.0 + 0.5) as u16;
 
     [
         // --- 1. GAP Flags (3 bytes) ---
@@ -305,7 +284,7 @@ async fn setup_ble_advertising(sd: &'static Softdevice, weight: f32, weight_raw:
     };
 
     let _ = with_timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(3),
         ble::peripheral::advertise(sd, adv, &config)
     ).await;
 }
