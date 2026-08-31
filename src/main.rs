@@ -1,21 +1,23 @@
 #![no_std]
 #![no_main]
 
-use cortex_m_rt::{exception, ExceptionFrame};
+use cortex_m_rt::{ExceptionFrame, exception};
 use embassy_executor::Spawner;
 use embassy_nrf::{
     bind_interrupts, gpio,
     interrupt::{self, typelevel::Interrupt as _},
-    peripherals,
-    twim
+    peripherals, qspi, twim,
 };
-use embassy_time::{with_timeout, Delay, Duration, Timer};
-use nrf_softdevice::{Softdevice, ble};
-use embedded_hal::digital::{InputPin, OutputPin};
-use hx711::{Hx711};
-use lis3dh_async::{Lis3dh, SlaveAddr, Mode, DataRate, Range, IrqPin1Config, Interrupt1, InterruptMode, InterruptConfig, LatchInterruptRequest, Detect4D, Threshold, Duration as Lis3dhDuration, Error};
+use embassy_time::{Delay, Duration, Timer, with_timeout};
 use embedded_hal;
+use embedded_hal::digital::{InputPin, OutputPin};
+use hx711::Hx711;
+use lis3dh_async::{
+    DataRate, Detect4D, Duration as Lis3dhDuration, Error, Interrupt1, InterruptConfig,
+    InterruptMode, IrqPin1Config, LatchInterruptRequest, Lis3dh, Mode, Range, SlaveAddr, Threshold,
+};
 use nb::Error::WouldBlock;
+use nrf_softdevice::{Softdevice, ble};
 use rtt_target::rtt_init_log;
 
 // const SCALE: f32 = 1.0/57156.0;
@@ -24,6 +26,7 @@ const SCALE1: f32 = 9.097367596346918e-06;
 bind_interrupts!(
     struct Irqs {
         TWISPI1 => twim::InterruptHandler<peripherals::TWISPI1>;
+        QSPI => qspi::InterruptHandler<peripherals::QSPI>;
     }
 );
 
@@ -31,9 +34,9 @@ bind_interrupts!(
 fn panic(_: &core::panic::PanicInfo) -> ! {
     let p0 = embassy_nrf::pac::P0;
     loop {
-        p0.outset().write(|w| { w.set_pin(26, true) });
+        p0.outset().write(|w| w.set_pin(26, true));
         cortex_m::asm::delay(1_000_000);
-        p0.outclr().write(|w| { w.set_pin(26, true) });
+        p0.outclr().write(|w| w.set_pin(26, true));
         cortex_m::asm::delay(1_000_000);
     }
 }
@@ -43,13 +46,13 @@ unsafe fn HardFault(_ef: &ExceptionFrame) -> ! {
     let p0 = embassy_nrf::pac::P0;
 
     loop {
-        p0.outclr().write(|w| { w.set_pin(26, true) });
+        p0.outclr().write(|w| w.set_pin(26, true));
         cortex_m::asm::delay(1_000_000);
-        p0.outset().write(|w| { w.set_pin(26, true) });
+        p0.outset().write(|w| w.set_pin(26, true));
         cortex_m::asm::delay(1_000_000);
-        p0.outclr().write(|w| { w.set_pin(26, true) });
+        p0.outclr().write(|w| w.set_pin(26, true));
         cortex_m::asm::delay(1_000_000);
-        p0.outset().write(|w| { w.set_pin(26, true) });
+        p0.outset().write(|w| w.set_pin(26, true));
         cortex_m::asm::delay(5_000_000);
     }
 }
@@ -58,10 +61,10 @@ type Accel = Lis3dh<lis3dh_async::Lis3dhI2C<twim::Twim<'static>>>;
 
 async fn init_accelerometer<E>(i2c: twim::Twim<'static>) -> Result<Accel, Error<E>>
 where
-    Error<E>: From<Error<twim::Error>>
+    Error<E>: From<Error<twim::Error>>,
 {
     let mut lis3dh = Lis3dh::new_i2c(i2c, SlaveAddr::Default).await?;
-    let range = Range::G2;          // load-cell platform motion is coarse; ±2g is plenty
+    let range = Range::G2; // load-cell platform motion is coarse; ±2g is plenty
     let data_rate = DataRate::Hz_10; // lowest ODR = lowest current in low-power mode
 
     // LowPower mode (8-bit resolution) + low ODR is the chip's minimum-current combo —
@@ -76,21 +79,27 @@ where
     // let duration = Lis3dhDuration::miliseconds(data_rate, 1.0); // fire immediately, no min dwell
     let duration = Lis3dhDuration::ZERO;
 
-    lis3dh.configure_irq_src_and_control(
-        Interrupt1,
-        InterruptMode::Movement,
-        InterruptConfig::high_and_low(),
-        LatchInterruptRequest::Enable, // hold INT1 high until we read IRQ src — don't miss short events
-        Detect4D::Disable,
-    ).await?;
+    lis3dh
+        .configure_irq_src_and_control(
+            Interrupt1,
+            InterruptMode::Movement,
+            InterruptConfig::high_and_low(),
+            LatchInterruptRequest::Enable, // hold INT1 high until we read IRQ src — don't miss short events
+            Detect4D::Disable,
+        )
+        .await?;
     lis3dh.configure_irq_duration(Interrupt1, duration).await?;
-    lis3dh.configure_irq_threshold(Interrupt1, threshold).await?;
+    lis3dh
+        .configure_irq_threshold(Interrupt1, threshold)
+        .await?;
 
     // Route interrupt 1 to the INT1 pin.
-    lis3dh.configure_interrupt_pin(IrqPin1Config {
-        ia1_en: true,
-        ..IrqPin1Config::default()
-    }).await?;
+    lis3dh
+        .configure_interrupt_pin(IrqPin1Config {
+            ia1_en: true,
+            ..IrqPin1Config::default()
+        })
+        .await?;
 
     lis3dh.get_irq_src(Interrupt1).await?;
 
@@ -132,13 +141,49 @@ async fn main(spawner: Spawner) {
     let peripherals = embassy_nrf::init(config);
     interrupt::typelevel::TWISPI0::set_priority(interrupt::Priority::P3);
     interrupt::typelevel::TWISPI1::set_priority(interrupt::Priority::P3);
+    interrupt::typelevel::QSPI::set_priority(interrupt::Priority::P3);
+
+    let led_red = gpio::Output::new(
+        peripherals.P0_26,
+        gpio::Level::High,
+        gpio::OutputDrive::Standard,
+    );
+    let _led_green = gpio::Output::new(
+        peripherals.P0_30,
+        gpio::Level::High,
+        gpio::OutputDrive::Standard,
+    ); // unused
+    let led_blue = gpio::Output::new(
+        peripherals.P0_06,
+        gpio::Level::High,
+        gpio::OutputDrive::Standard,
+    );
+
+    {
+        // turn off flash
+        let mut config = qspi::Config::default();
+        config.capacity = 2 * 1024 * 1024; // P25Q16H = 16 megabit = 2MB
+        config.frequency = qspi::Frequency::M2;
+        config.deep_power_down = Some(qspi::DeepPowerDownConfig {
+            enter_time: 3,
+            exit_time: 3,
+        });
+
+        let _qspi = qspi::Qspi::new(
+            peripherals.QSPI,
+            Irqs,
+            peripherals.P0_21, // SCK
+            peripherals.P0_25, // CSN
+            peripherals.P0_20, // SIO0
+            peripherals.P0_24, // SIO1
+            peripherals.P0_22, // SIO2
+            peripherals.P0_23, // SIO3
+            config,
+        );
+    }
 
     let config = softdevice_config();
     let sd = Softdevice::enable(&config);
-
-    let _led_red = gpio::Output::new(peripherals.P0_26, gpio::Level::High, gpio::OutputDrive::Standard); // unused
-    let _led_green = gpio::Output::new(peripherals.P0_30, gpio::Level::High, gpio::OutputDrive::Standard); // unused
-    let led_blue = gpio::Output::new(peripherals.P0_06, gpio::Level::High, gpio::OutputDrive::Standard);
 
     let mut config = twim::Config::default();
     config.frequency = twim::Frequency::K100; // bump to K400 once it's working reliably
@@ -148,35 +193,57 @@ async fn main(spawner: Spawner) {
     let i2c = twim::Twim::new(
         peripherals.TWISPI1,
         Irqs,
-        peripherals.P1_15 /*SDA*/,
-        peripherals.P1_14 /*SCL*/,
+        peripherals.P1_15, /*SDA*/
+        peripherals.P1_14, /*SCL*/
         config,
-        &mut[]
+        &mut [],
     );
 
-    let mut a = init_accelerometer(i2c).await.expect("cannot initialize accelerometer");
+    let mut oa = match init_accelerometer(i2c).await {
+        Ok(a) => Some(a),
+        Err(e) => {log::error!("Error initializing accelerometer: {:?}", e); None},
+    };
 
-    let mut int1_pin = gpio::Input::new(peripherals.P0_28, gpio::Pull::None); // accelerometer interrupt
+    let mut int1_pin = gpio::Input::new(peripherals.P0_28, gpio::Pull::Down); // accelerometer interrupt
     let dfu_btn = gpio::Input::new(peripherals.P1_11, gpio::Pull::Up); // dfu button
 
-    let sck_pin = gpio::Output::new(peripherals.P0_02, gpio::Level::Low, gpio::OutputDrive::Standard);
+    let sck_pin = gpio::Output::new(
+        peripherals.P0_02,
+        gpio::Level::Low,
+        gpio::OutputDrive::Standard,
+    );
     let dout_pin = gpio::Input::new(peripherals.P0_03, gpio::Pull::Up);
 
     let mut load_sensor = Hx711::new(Delay, dout_pin, sck_pin).expect("Can't connect to hx711");
 
     let offset = tare(&mut load_sensor, 5).await;
     load_sensor.disable().expect("Can't disable hx711");
-    
-    spawner.spawn(blink_task(led_blue).unwrap());
+
+    match &mut oa {
+        None => {
+            spawner.spawn(blink_task(led_red).unwrap());
+        }
+        Some(_) => {
+            spawner.spawn(blink_task(led_blue).unwrap());
+        }
+    }
     spawner.spawn(bootloader(dfu_btn).unwrap());
+
+    Timer::after(Duration::from_secs(10)).await;
     loop {
         if int1_pin.is_high() {
-            a.get_irq_src(Interrupt1).await.expect("Couldn't get irq src");
+            if let Some(a) = &mut oa {
+            a.get_irq_src(Interrupt1)
+                    .await
+                    .expect("Couldn't get irq src");
+            }
         }
         int1_pin.wait_for_rising_edge().await;
-        match a.get_irq_src(Interrupt1).await {
-            Ok(src) => log::info!("Edge detected: {:?}. Waiting", src),
-            Err(e) => log::error!("Error waiting edge: {:?}", e)
+        if let Some(a) = &mut oa {
+            match a.get_irq_src(Interrupt1).await {
+                Ok(src) => log::info!("Edge detected: {:?}. Waiting", src),
+                Err(e) => log::error!("Error waiting edge: {:?}", e),
+            }
         }
         Timer::after(Duration::from_secs(5)).await;
 
@@ -190,8 +257,7 @@ async fn main(spawner: Spawner) {
     }
 }
 
-#[embassy_executor::task]
-async fn blink_task(mut led: gpio::Output<'static>) {
+async fn blink_led(led: &mut gpio::Output<'static>) {
     for _ in 0..2 {
         led.set_low();
         Timer::after(Duration::from_millis(200)).await;
@@ -201,19 +267,23 @@ async fn blink_task(mut led: gpio::Output<'static>) {
 }
 
 #[embassy_executor::task]
+async fn blink_task(mut led: gpio::Output<'static>) {
+    blink_led(&mut led).await;
+}
+
+#[embassy_executor::task]
 async fn bootloader(mut dfu_btn: gpio::Input<'static>) -> ! {
     dfu_btn.wait_for_falling_edge().await;
     reset_into_dfu()
 }
 
-
 async fn read_weight<SckPin, DTPin>(
     load_sensor: &mut Hx711<Delay, DTPin, SckPin>,
-    offset: i32
+    offset: i32,
 ) -> Option<i32>
 where
     SckPin: OutputPin,
-    DTPin: InputPin
+    DTPin: InputPin,
 {
     loop {
         match load_sensor.retrieve() {
@@ -221,7 +291,7 @@ where
             Ok(raw) => break Some(raw - offset),
             Err(e) => {
                 log::error!("Error: {:?}", e);
-                break None
+                break None;
             }
         }
     }
@@ -230,11 +300,13 @@ where
 async fn tare<SckPin, DTPin>(load_sensor: &mut Hx711<Delay, DTPin, SckPin>, num_samples: u8) -> i32
 where
     SckPin: OutputPin,
-    DTPin: InputPin
+    DTPin: InputPin,
 {
     let mut average: i32 = 0;
     for _ in 1..=num_samples {
-        let raw = read_weight(load_sensor, 0).await.expect("Couldn't read weight");
+        let raw = read_weight(load_sensor, 0)
+            .await
+            .expect("Couldn't read weight");
         average += raw;
         Timer::after(Duration::from_millis(50)).await;
     }
@@ -246,18 +318,21 @@ fn build_bthome_payload(weight_kg: f32, weight_raw: i32, battery_pct: u8) -> [u8
 
     [
         // --- 1. GAP Flags (3 bytes) ---
-        0x02, 0x01, 0x06,
+        0x02,
+        0x01,
+        0x06,
         // --- 2. BTHome V2 Service Data (10 bytes) ---
-        0x0F,       // Structure length
-        0x16,       // AD Type: Service Data 16-bit UUID
-        0xD2, 0xFC, // BTHome UUID 0xFCD2 (Little-Endian)
-        0x40,       // BTHome V2 Header (Unencrypted)
+        0x0F, // Structure length
+        0x16, // AD Type: Service Data 16-bit UUID
+        0xD2,
+        0xFC, // BTHome UUID 0xFCD2 (Little-Endian)
+        0x40, // BTHome V2 Header (Unencrypted)
         // --- 3.
-        0x06,       // Sensor ID: Mass (0x06)
+        0x06, // Sensor ID: Mass (0x06)
         weight_converted as u8,
         (weight_converted >> 8) as u8,
         // --- 4.
-        0x01,       // Sensor ID: Battery % (0x01)
+        0x01, // Sensor ID: Battery % (0x01)
         battery_pct,
         0x54,
         0x04,
@@ -271,9 +346,9 @@ fn build_bthome_payload(weight_kg: f32, weight_raw: i32, battery_pct: u8) -> [u8
 async fn setup_ble_advertising(sd: &'static Softdevice, weight: f32, weight_raw: i32, battery: u8) {
     let adv_data = build_bthome_payload(weight, weight_raw, battery);
     let scan_data = [
-        0x0A,       // Structure length: 1 byte (type) + 9 bytes ("Cat Scale") = 10 (0x0A)
-        0x09,       // AD Type: Complete Local Name (0x09)
-        b'C', b'a', b't', b' ', b'S', b'c', b'a', b'l', b'e'
+        0x0A, // Structure length: 1 byte (type) + 9 bytes ("Cat Scale") = 10 (0x0A)
+        0x09, // AD Type: Complete Local Name (0x09)
+        b'C', b'a', b't', b' ', b'S', b'c', b'a', b'l', b'e',
     ];
 
     // Configure non-connectable, fast broadcasting payload
@@ -285,8 +360,9 @@ async fn setup_ble_advertising(sd: &'static Softdevice, weight: f32, weight_raw:
 
     let _ = with_timeout(
         Duration::from_secs(3),
-        ble::peripheral::advertise(sd, adv, &config)
-    ).await;
+        ble::peripheral::advertise(sd, adv, &config),
+    )
+    .await;
 }
 
 fn softdevice_config() -> nrf_softdevice::Config {
