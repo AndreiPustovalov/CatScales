@@ -8,6 +8,7 @@ use embassy_nrf::{
     interrupt::{self, typelevel::Interrupt as _},
     peripherals, qspi, twim,
 };
+use embassy_nrf::saadc::{self, Saadc};
 use embassy_time::{Delay, Duration, Timer, with_timeout};
 use embedded_hal;
 use embedded_hal::digital::{InputPin, OutputPin};
@@ -20,13 +21,14 @@ use nb::Error::WouldBlock;
 use nrf_softdevice::{Softdevice, ble};
 use rtt_target::rtt_init_log;
 
-// const SCALE: f32 = 1.0/57156.0;
-const SCALE1: f32 = 9.097367596346918e-06;
+const SCALE1: f32 = 9.10412724e-06;
+const SCALE2: f32 = 8.94257018e-06;
 
 bind_interrupts!(
     struct Irqs {
         TWISPI1 => twim::InterruptHandler<peripherals::TWISPI1>;
         QSPI => qspi::InterruptHandler<peripherals::QSPI>;
+        SAADC => saadc::InterruptHandler;
     }
 );
 
@@ -63,7 +65,7 @@ async fn init_accelerometer<E>(i2c: twim::Twim<'static>) -> Result<Accel, Error<
 where
     Error<E>: From<Error<twim::Error>>,
 {
-    let mut lis3dh = Lis3dh::new_i2c(i2c, SlaveAddr::Default).await?;
+    let mut lis3dh = Lis3dh::new_i2c(i2c, SlaveAddr::Alternate).await?;
     let range = Range::G2; // load-cell platform motion is coarse; ±2g is plenty
     let data_rate = DataRate::Hz_10; // lowest ODR = lowest current in low-power mode
 
@@ -148,11 +150,11 @@ async fn main(spawner: Spawner) {
         gpio::Level::High,
         gpio::OutputDrive::Standard,
     );
-    let _led_green = gpio::Output::new(
+    let mut led_green = gpio::Output::new(
         peripherals.P0_30,
         gpio::Level::High,
         gpio::OutputDrive::Standard,
-    ); // unused
+    );
     let led_blue = gpio::Output::new(
         peripherals.P0_06,
         gpio::Level::High,
@@ -207,29 +209,50 @@ async fn main(spawner: Spawner) {
     let mut int1_pin = gpio::Input::new(peripherals.P0_28, gpio::Pull::Down); // accelerometer interrupt
     let dfu_btn = gpio::Input::new(peripherals.P1_11, gpio::Pull::Up); // dfu button
 
-    let sck_pin = gpio::Output::new(
+    let sck_pin1 = gpio::Output::new(
         peripherals.P0_02,
         gpio::Level::Low,
         gpio::OutputDrive::Standard,
     );
-    let dout_pin = gpio::Input::new(peripherals.P0_03, gpio::Pull::Up);
+    let dout_pin1 = gpio::Input::new(peripherals.P0_03, gpio::Pull::Up);
 
-    let mut load_sensor = Hx711::new(Delay, dout_pin, sck_pin).expect("Can't connect to hx711");
+    let mut load_sensor1 = Hx711::new(Delay, dout_pin1, sck_pin1).expect("Can't connect to hx711 #1");
 
-    let offset = tare(&mut load_sensor, 5).await;
-    load_sensor.disable().expect("Can't disable hx711");
+    let offset1 = tare(&mut load_sensor1, 5).await;
+    load_sensor1.disable().expect("Can't disable hx711");
+
+    let sck_pin2 = gpio::Output::new(
+        peripherals.P1_13,
+        gpio::Level::Low,
+        gpio::OutputDrive::Standard,
+    );
+    let dout_pin2 = gpio::Input::new(peripherals.P1_12, gpio::Pull::Up);
+
+    let mut load_sensor2 = Hx711::new(Delay, dout_pin2, sck_pin2).expect("Can't connect to hx711 #2");
+
+    let offset2 = tare(&mut load_sensor2, 5).await;
+    load_sensor2.disable().expect("Can't disable hx711");
+
+    let mut channel_cfg = saadc::ChannelConfig::single_ended(saadc::VddInput);
+    // gain must divide VDD down into the 0.6V reference range:
+    // 3.6V max / 6 = 0.6V, so gain 1/6 with the internal reference
+    channel_cfg.gain = saadc::Gain::Gain1_6;
+    channel_cfg.reference = saadc::Reference::Internal;
+
+    let mut saadc = Saadc::new(peripherals.SAADC, Irqs, saadc::Config::default(), [channel_cfg]);
+
+    let mut buf = [0i16; 1];
 
     match &mut oa {
         None => {
-            spawner.spawn(blink_task(led_red).unwrap());
+            spawner.spawn(blink_task(led_red, 2).unwrap());
         }
         Some(_) => {
-            spawner.spawn(blink_task(led_blue).unwrap());
+            spawner.spawn(blink_task(led_blue, 2).unwrap());
         }
     }
     spawner.spawn(bootloader(dfu_btn).unwrap());
 
-    Timer::after(Duration::from_secs(10)).await;
     loop {
         if int1_pin.is_high() {
             if let Some(a) = &mut oa {
@@ -239,26 +262,39 @@ async fn main(spawner: Spawner) {
             }
         }
         int1_pin.wait_for_rising_edge().await;
+        blink_led(&mut led_green, 1).await;
         if let Some(a) = &mut oa {
             match a.get_irq_src(Interrupt1).await {
                 Ok(src) => log::info!("Edge detected: {:?}. Waiting", src),
                 Err(e) => log::error!("Error waiting edge: {:?}", e),
             }
         }
-        Timer::after(Duration::from_secs(5)).await;
+        load_sensor1.enable().expect("Can't enable hx711 #1");
+        load_sensor2.enable().expect("Can't enable hx711 #2");
+        Timer::after(Duration::from_secs(1)).await;
 
-        load_sensor.enable().expect("Can't enable hx711");
-        if let Some(raw) = read_weight(&mut load_sensor, offset).await {
-            let kg = raw as f32 * SCALE1;
-            setup_ble_advertising(sd, kg, raw, 90).await;
-            log::info!("Sent: {} kg, {} raw", kg, raw);
+        saadc.sample(&mut buf).await;
+
+        // 12-bit single-ended: full scale 4095 = 0.6V × 6 = 3.6V
+        let millivolts = ((buf[0] as u32 * 3600) / 4095 - 1800) / 10;
+
+        let raw_option1 = read_weight(&mut load_sensor1, offset1).await;
+        let raw_option2 = read_weight(&mut load_sensor2, offset2).await;
+
+        if let (Some(raw1), Some(raw2)) = (raw_option1, raw_option2) {
+            let kg1 = raw1 as f32 * SCALE1;
+            let kg2 = raw2 as f32 * SCALE2;
+            setup_ble_advertising(sd, kg1 + kg2, raw1, raw2, millivolts as u8).await;
+            log::info!("Sent: {} kg,  raw1: {}, raw2: {}", kg1+kg2, raw1, raw2);
         }
-        load_sensor.disable().expect("Can't disable hx711");
+
+        load_sensor1.disable().expect("Can't disable hx711 #1");
+        load_sensor2.disable().expect("Can't disable hx711 #2");
     }
 }
 
-async fn blink_led(led: &mut gpio::Output<'static>) {
-    for _ in 0..2 {
+async fn blink_led(led: &mut gpio::Output<'static>, n: u8) {
+    for _ in 0..n {
         led.set_low();
         Timer::after(Duration::from_millis(200)).await;
         led.set_high();
@@ -267,8 +303,8 @@ async fn blink_led(led: &mut gpio::Output<'static>) {
 }
 
 #[embassy_executor::task]
-async fn blink_task(mut led: gpio::Output<'static>) {
-    blink_led(&mut led).await;
+async fn blink_task(mut led: gpio::Output<'static>, n: u8) {
+    blink_led(&mut led, n).await;
 }
 
 #[embassy_executor::task]
@@ -313,7 +349,7 @@ where
     (average as f32 / num_samples as f32) as i32
 }
 
-fn build_bthome_payload(weight_kg: f32, weight_raw: i32, battery_pct: u8) -> [u8; 19] {
+fn build_bthome_payload(weight_kg: f32, weight_raw1: i32, weight_raw2: i32, battery_pct: u8) -> [u8; 25] {
     let weight_converted = (weight_kg * 100.0 + 0.5) as u16;
 
     [
@@ -322,7 +358,7 @@ fn build_bthome_payload(weight_kg: f32, weight_raw: i32, battery_pct: u8) -> [u8
         0x01,
         0x06,
         // --- 2. BTHome V2 Service Data (10 bytes) ---
-        0x0F, // Structure length
+        0x15, // Structure length
         0x16, // AD Type: Service Data 16-bit UUID
         0xD2,
         0xFC, // BTHome UUID 0xFCD2 (Little-Endian)
@@ -336,15 +372,21 @@ fn build_bthome_payload(weight_kg: f32, weight_raw: i32, battery_pct: u8) -> [u8
         battery_pct,
         0x54,
         0x04,
-        weight_raw as u8,
-        (weight_raw >> 8) as u8,
-        (weight_raw >> 16) as u8,
-        (weight_raw >> 24) as u8,
+        weight_raw1 as u8,
+        (weight_raw1 >> 8) as u8,
+        (weight_raw1 >> 16) as u8,
+        (weight_raw1 >> 24) as u8,
+        0x54,
+        0x04,
+        weight_raw2 as u8,
+        (weight_raw2 >> 8) as u8,
+        (weight_raw2 >> 16) as u8,
+        (weight_raw2 >> 24) as u8,
     ]
 }
 
-async fn setup_ble_advertising(sd: &'static Softdevice, weight: f32, weight_raw: i32, battery: u8) {
-    let adv_data = build_bthome_payload(weight, weight_raw, battery);
+async fn setup_ble_advertising(sd: &'static Softdevice, weight: f32, weight_raw1: i32, weight_raw2: i32, battery: u8) {
+    let adv_data = build_bthome_payload(weight, weight_raw1, weight_raw2, battery);
     let scan_data = [
         0x0A, // Structure length: 1 byte (type) + 9 bytes ("Cat Scale") = 10 (0x0A)
         0x09, // AD Type: Complete Local Name (0x09)
