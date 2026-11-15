@@ -145,7 +145,7 @@ async fn main(spawner: Spawner) {
     interrupt::typelevel::TWISPI1::set_priority(interrupt::Priority::P3);
     interrupt::typelevel::QSPI::set_priority(interrupt::Priority::P3);
 
-    let led_red = gpio::Output::new(
+    let mut led_red = gpio::Output::new(
         peripherals.P0_26,
         gpio::Level::High,
         gpio::OutputDrive::Standard,
@@ -155,7 +155,7 @@ async fn main(spawner: Spawner) {
         gpio::Level::High,
         gpio::OutputDrive::Standard,
     );
-    let led_blue = gpio::Output::new(
+    let mut led_blue = gpio::Output::new(
         peripherals.P0_06,
         gpio::Level::High,
         gpio::OutputDrive::Standard,
@@ -208,6 +208,7 @@ async fn main(spawner: Spawner) {
 
     let mut int1_pin = gpio::Input::new(peripherals.P0_28, gpio::Pull::Down); // accelerometer interrupt
     let dfu_btn = gpio::Input::new(peripherals.P1_11, gpio::Pull::Up); // dfu button
+    spawner.spawn(bootloader(dfu_btn).unwrap());
 
     let sck_pin1 = gpio::Output::new(
         peripherals.P0_02,
@@ -245,13 +246,12 @@ async fn main(spawner: Spawner) {
 
     match &mut oa {
         None => {
-            spawner.spawn(blink_task(led_red, 2).unwrap());
+            blink_led(&mut led_red, 2).await;
         }
         Some(_) => {
-            spawner.spawn(blink_task(led_blue, 2).unwrap());
+            blink_led(&mut led_blue, 2).await;
         }
     }
-    spawner.spawn(bootloader(dfu_btn).unwrap());
 
     loop {
         if int1_pin.is_high() {
@@ -286,6 +286,8 @@ async fn main(spawner: Spawner) {
             let kg2 = raw2 as f32 * SCALE2;
             setup_ble_advertising(sd, kg1 + kg2, raw1, raw2, millivolts as u8).await;
             log::info!("Sent: {} kg,  raw1: {}, raw2: {}", kg1+kg2, raw1, raw2);
+        } else {
+            blink_led(&mut led_red, 1).await;
         }
 
         load_sensor1.disable().expect("Can't disable hx711 #1");
@@ -321,16 +323,17 @@ where
     SckPin: OutputPin,
     DTPin: InputPin,
 {
-    loop {
+    for _ in 0..100 {
         match load_sensor.retrieve() {
             Err(WouldBlock) => Timer::after(Duration::from_millis(10)).await,
-            Ok(raw) => break Some(raw - offset),
+            Ok(raw) => return Some(raw - offset),
             Err(e) => {
                 log::error!("Error: {:?}", e);
-                break None;
+                return None;
             }
         }
     }
+    None
 }
 
 async fn tare<SckPin, DTPin>(load_sensor: &mut Hx711<Delay, DTPin, SckPin>, num_samples: u8) -> i32
