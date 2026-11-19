@@ -200,15 +200,18 @@ async fn main(spawner: Spawner) {
         config,
         &mut [],
     );
+    let mut boost = gpio::Output::new(peripherals.P0_04, gpio::Level::High, gpio::OutputDrive::Standard);
 
     let mut oa = match init_accelerometer(i2c).await {
-        Ok(a) => Some(a),
+        Ok(a) => {log::info!("Accelerometer ok"); Some(a)},
         Err(e) => {log::error!("Error initializing accelerometer: {:?}", e); None},
     };
 
     let mut int1_pin = gpio::Input::new(peripherals.P0_28, gpio::Pull::Down); // accelerometer interrupt
-    let dfu_btn = gpio::Input::new(peripherals.P1_11, gpio::Pull::Up); // dfu button
+    let dfu_btn = gpio::Input::new(peripherals.P0_05, gpio::Pull::Up); // dfu button
     spawner.spawn(bootloader(dfu_btn).unwrap());
+
+    Timer::after(Duration::from_secs(1)).await;
 
     let sck_pin1 = gpio::Output::new(
         peripherals.P0_02,
@@ -253,6 +256,7 @@ async fn main(spawner: Spawner) {
         }
     }
 
+    boost.set_low();
     loop {
         if int1_pin.is_high() {
             if let Some(a) = &mut oa {
@@ -269,14 +273,16 @@ async fn main(spawner: Spawner) {
                 Err(e) => log::error!("Error waiting edge: {:?}", e),
             }
         }
+        saadc.sample(&mut buf).await;
+        // 12-bit single-ended: full scale 4095 = 0.6V × 6 = 3.6V
+        let millivolts = ((buf[0] as u32 * 3600) / 4095) / 10;
+
+        boost.set_high();
+        Timer::after(Duration::from_secs(1)).await;
+
         load_sensor1.enable().expect("Can't enable hx711 #1");
         load_sensor2.enable().expect("Can't enable hx711 #2");
         Timer::after(Duration::from_secs(1)).await;
-
-        saadc.sample(&mut buf).await;
-
-        // 12-bit single-ended: full scale 4095 = 0.6V × 6 = 3.6V
-        let millivolts = ((buf[0] as u32 * 3600) / 4095 - 1800) / 10;
 
         let raw_option1 = read_weight(&mut load_sensor1, offset1).await;
         let raw_option2 = read_weight(&mut load_sensor2, offset2).await;
@@ -292,6 +298,7 @@ async fn main(spawner: Spawner) {
 
         load_sensor1.disable().expect("Can't disable hx711 #1");
         load_sensor2.disable().expect("Can't disable hx711 #2");
+        boost.set_low();
     }
 }
 
