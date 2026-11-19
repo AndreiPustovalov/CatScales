@@ -21,8 +21,8 @@ use nb::Error::WouldBlock;
 use nrf_softdevice::{Softdevice, ble};
 use rtt_target::rtt_init_log;
 
-const SCALE1: f32 = 9.10412724e-06;
-const SCALE2: f32 = 8.94257018e-06;
+const SCALE1: f32 = 9.07474482e-06;
+const SCALE2: f32 = 9.25707368e-06;
 
 bind_interrupts!(
     struct Irqs {
